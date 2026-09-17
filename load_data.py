@@ -208,6 +208,85 @@ def load_csv_dataset(csv_path: str, target_cols=None, downsample_to: int = None)
     return X, Y, split, ids
 
 
+def load_csv_features_only(csv_path: str, downsample_to: int = None):
+    """Load a CSV file as feature-only input for pure inference.
+
+    This is the prediction-compatible version of the CSV loader: it reads the
+    z000, z001, ... feature columns but does not require target columns.
+    """
+    with open(csv_path, newline="") as f:
+        reader = csv.DictReader(f)
+        if reader.fieldnames is None:
+            raise ValueError(f"CSV file {csv_path} is empty or missing a header row.")
+
+        feature_cols = [name for name in reader.fieldnames if name.startswith("z")]
+        if not feature_cols:
+            raise ValueError(
+                f"CSV file {csv_path} does not contain z000-style feature columns. "
+                "Prediction requires spectral features with names like z000, z001, ..."
+            )
+
+        xs, ids = [], []
+        for row in reader:
+            sample_id = row.get("labsampnum") or row.get("sample_id")
+            if sample_id is None or not sample_id:
+                continue
+            feature_values = []
+            for col in feature_cols:
+                value = row.get(col, "")
+                if value in ("", "NA", "N/A", "nan", "NaN"):
+                    value = np.nan
+                else:
+                    value = float(value)
+                feature_values.append(value)
+            if any(np.isnan(v) for v in feature_values):
+                continue
+            xs.append(np.asarray(feature_values, dtype=np.float32))
+            ids.append(sample_id)
+
+    if not xs:
+        raise ValueError(f"No valid feature rows found in {csv_path}.")
+
+    X = np.stack(xs).astype(np.float32)
+    if downsample_to is not None and downsample_to < X.shape[1]:
+        bin_size = X.shape[1] // downsample_to
+        usable = bin_size * downsample_to
+        X = X[:, :usable].reshape(X.shape[0], downsample_to, bin_size).mean(axis=2)
+    return X, ids
+
+
+def load_prediction_dataset(data_path: str, downsample_to: int = None):
+    """Return feature-only data for prediction.
+
+    Supports CSV files with z000... features and SQLite DB files with a
+    mir_spectra table.
+    """
+    if str(data_path).lower().endswith(".csv"):
+        return load_csv_features_only(data_path, downsample_to=downsample_to)
+
+    conn = sqlite3.connect(data_path)
+    cur = conn.cursor()
+    cur.execute("SELECT sample_id, absorbance FROM mir_spectra;")
+    rows = cur.fetchall()
+    conn.close()
+
+    if not rows:
+        raise ValueError(f"No spectra found in SQLite file {data_path}.")
+
+    xs, ids = [], []
+    for sample_id, blob in rows:
+        spec = _decode_spectrum(blob)
+        xs.append(spec.astype(np.float32))
+        ids.append(sample_id)
+
+    X = np.stack(xs).astype(np.float32)
+    if downsample_to is not None and downsample_to < X.shape[1]:
+        bin_size = X.shape[1] // downsample_to
+        usable = bin_size * downsample_to
+        X = X[:, :usable].reshape(X.shape[0], downsample_to, bin_size).mean(axis=2)
+    return X, ids
+
+
 def build_dataset(db_path: str, target_cols=None, downsample_to: int = None,
                    min_overlap_fraction: float = 0.5):
     """

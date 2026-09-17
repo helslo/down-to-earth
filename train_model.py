@@ -5,6 +5,7 @@ benchmark targets and its predefined train/test split.
 Usage:
     python train_model.py path/to/your_dataset.db
 """
+import argparse
 import sys
 import numpy as np
 import torch
@@ -41,7 +42,7 @@ def compute_calibration_factor(predicted: np.ndarray, sigma: np.ndarray, target:
     return float(np.sqrt(np.mean(z ** 2)))
 
 
-def train_and_calibrate(data_path: str):
+def train_and_calibrate(data_path: str, epochs: int = 100, downsample_to: int = 170, max_samples: int = None):
     # guo_subset's 5 properties that map onto the paper's target list.
     # Swap in 'CEC', 'Clay', 'P' here too/instead if that's more useful
     # for your farmer conversations -- they're in the same table.
@@ -52,8 +53,13 @@ def train_and_calibrate(data_path: str):
     print(f"Loading {dataset_kind} dataset from: {data_path}")
 
     X, Y, split, sample_ids = build_dataset(
-        data_path, target_cols=task_names, downsample_to=170
+        data_path, target_cols=task_names, downsample_to=downsample_to
     )
+    if max_samples is not None and max_samples < len(X):
+        X = X[:max_samples]
+        split = split[:max_samples]
+        for t in task_names:
+            Y[t] = Y[t][:max_samples]
     print(f"Loaded {len(X)} samples with complete {task_names} targets.")
     print(f"Split counts: {dict(zip(*np.unique(split, return_counts=True)))}")
 
@@ -105,7 +111,7 @@ def train_and_calibrate(data_path: str):
     alpha_raw = torch.nn.Parameter(torch.tensor(0.5413, device=device))
     optimizer = torch.optim.Adam(list(model.parameters()) + [alpha_raw], lr=1e-3)
 
-    n_epochs = 100
+    n_epochs = epochs
     for epoch in range(n_epochs):
         model.train()
         epoch_loss = 0.0
@@ -119,7 +125,7 @@ def train_and_calibrate(data_path: str):
             torch.nn.utils.clip_grad_norm_(list(model.parameters()) + [alpha_raw], max_norm=1.0)
             optimizer.step()
             epoch_loss += loss.item()
-        if epoch % 10 == 0 or epoch == n_epochs - 1:
+        if epoch % max(1, n_epochs // 10) == 0 or epoch == n_epochs - 1:
             print(
                 f"epoch {epoch:3d} | loss={epoch_loss / len(train_loader):.4f} "
                 f"nll={logs['nll']:.4f} kl={logs['kl']:.4f} ec={logs['ec']:.2f} "
@@ -162,12 +168,47 @@ def train_and_calibrate(data_path: str):
     return model, x_scaler, y_scalers, calibration_factors, task_names
 
 
-def main(data_path: str):
-    train_and_calibrate(data_path)
+def save_checkpoint(model, x_scaler, y_scalers, calibration_factors, task_names, downsample_to: int, path: str = "model_state.pt"):
+    """Save the fitted model + preprocessing state for later pure prediction."""
+    torch.save(
+        {
+            "model_state": model.state_dict(),
+            "task_names": task_names,
+            "fusion_edges": model.fusion_edges,
+            "downsample_to": int(downsample_to),
+            "x_scaler_mean": x_scaler.mean_.copy(),
+            "x_scaler_scale": x_scaler.scale_.copy(),
+            "y_scalers": {t: {"mean": s.mean_.copy(), "scale": s.scale_.copy()} for t, s in y_scalers.items()},
+            "calibration_factors": calibration_factors,
+        },
+        path,
+    )
+
+
+def main(data_path: str, epochs: int = 100, downsample_to: int = 170, max_samples: int = None, save_path: str = "model_state.pt"):
+    model, x_scaler, y_scalers, calibration_factors, task_names = train_and_calibrate(
+        data_path,
+        epochs=epochs,
+        downsample_to=downsample_to,
+        max_samples=max_samples,
+    )
+    save_checkpoint(model, x_scaler, y_scalers, calibration_factors, task_names, downsample_to, path=save_path)
+    print(f"Saved checkpoint to {save_path}")
 
 
 if __name__ == "__main__":
-    if len(sys.argv) != 2:
-        print("Usage: python train_model.py path/to/your_dataset.db OR path/to/your_dataset.csv")
-        sys.exit(1)
-    main(sys.argv[1])
+    parser = argparse.ArgumentParser(description="Train the FTIR soil-property model.")
+    parser.add_argument("data_path", help="Path to a CSV or SQLite dataset")
+    parser.add_argument("--epochs", type=int, default=100, help="Number of training epochs")
+    parser.add_argument("--downsample-to", type=int, default=170, help="Spectral downsampling target")
+    parser.add_argument("--max-samples", type=int, default=None, help="Limit rows for a quick smoke test")
+    parser.add_argument("--save-path", default="model_state.pt", help="Location for the saved checkpoint")
+    args = parser.parse_args()
+
+    main(
+        args.data_path,
+        epochs=args.epochs,
+        downsample_to=args.downsample_to,
+        max_samples=args.max_samples,
+        save_path=args.save_path,
+    )
