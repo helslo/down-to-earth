@@ -3,7 +3,7 @@ Train FTIRNet on real OSSL data, using the ready-made guo_subset
 benchmark targets and its predefined train/test split.
 
 Usage:
-    python train_ossl.py path/to/your_dataset.db
+    python train_model.py path/to/your_dataset.db
 """
 import sys
 import numpy as np
@@ -13,7 +13,7 @@ from sklearn.preprocessing import StandardScaler
 
 from model import FTIRNet
 from losses import total_loss
-from ossl_data import build_dataset
+from load_data import build_dataset
 
 
 class SoilDataset(Dataset):
@@ -30,12 +30,15 @@ class SoilDataset(Dataset):
         return self.X[idx], y
 
 
-def main(db_path: str):
+def main(data_path: str):
     # guo_subset's 5 properties that map onto the paper's target list.
     # Swap in 'CEC', 'Clay', 'P' here too/instead if that's more useful
     # for your farmer conversations -- they're in the same table.
     task_names = ["OC", "N", "pH", "Sand", "K"]
     fusion_edges = {"N": ["OC", "pH"]}  # paper's best-performing N config
+
+    dataset_kind = "CSV" if str(data_path).lower().endswith(".csv") else "SQLite"
+    print(f"Loading {dataset_kind} dataset from: {data_path}")
 
     # NOTE on downsample_to: the full spectrum is 1701 bands. A standard
     # transformer's self-attention is O(L^2) in sequence length, so
@@ -45,7 +48,7 @@ def main(db_path: str):
     # is a much cruder form of compression -- fine for an initial pass,
     # worth replacing with something smarter once this end-to-end path works).
     X, Y, split, sample_ids = build_dataset(
-        db_path, target_cols=task_names, downsample_to=170
+        data_path, target_cols=task_names, downsample_to=170
     )
     print(f"Loaded {len(X)} samples with complete {task_names} targets.")
     print(f"Split counts: {dict(zip(*np.unique(split, return_counts=True)))}")
@@ -149,6 +152,6 @@ def main(db_path: str):
 
 if __name__ == "__main__":
     if len(sys.argv) != 2:
-        print("Usage: python train_ossl.py path/to/your_dataset.db")
+        print("Usage: python train_model.py path/to/your_dataset.db OR path/to/your_dataset.csv")
         sys.exit(1)
     main(sys.argv[1])
