@@ -13,16 +13,20 @@ This repository trains a multitask soil-property model based on FTIR spectra. Th
    python train_model.py data/features_samples.csv
 
 3. Adjust the task names, fusion edges, and model settings in train_model.py for your target properties.
+4. If you want to predict on a dataset without a saved checkpoint, use:
+
+   python predict_model.py data/features_samples.csv
 
 ## File map
 
-- train_model.py: canonical training script; this is the main entry point.
+- train_model.py: canonical training script; trains the model and calibrates uncertainty on the validation/test split.
+- predict_model.py: dedicated prediction script that trains in memory and predicts on a new dataset without a saved model.
 - load_data.py: dataset loading for SQLite and CSV inputs.
 - model.py: FTIRNet model architecture and related transformer blocks.
-- losses.py: multitask loss and the EC schedule.
+- losses.py: multitask loss, EC schedule, and heteroscedastic regression loss.
 - inspect_db.py: quick inspection of a SQLite database schema.
 - inspect_db_printing.py: more detailed SQLite explorer for tables and statistics.
-- train_example.py: compatibility wrapper; kept only for older commands.
+- example_training.py: compatibility wrapper; kept only for older commands.
 - data/OSSL.db: example SQLite dataset.
 - data/features_samples.csv: example CSV dataset with spectral features and labels.
 - requirements.txt: project dependency list.

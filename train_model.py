@@ -30,7 +30,18 @@ class SoilDataset(Dataset):
         return self.X[idx], y
 
 
-def main(data_path: str):
+def compute_calibration_factor(predicted: np.ndarray, sigma: np.ndarray, target: np.ndarray, eps: float = 1e-6) -> float:
+    """Global temperature-style calibration for regression uncertainty.
+
+    We scale the model's standard deviation by a single factor so that the
+    average standardized residual matches 1 in the validation set.
+    """
+    sigma = np.clip(sigma, eps, None)
+    z = np.abs(target - predicted) / sigma
+    return float(np.sqrt(np.mean(z ** 2)))
+
+
+def train_and_calibrate(data_path: str):
     # guo_subset's 5 properties that map onto the paper's target list.
     # Swap in 'CEC', 'Clay', 'P' here too/instead if that's more useful
     # for your farmer conversations -- they're in the same table.
@@ -40,13 +51,6 @@ def main(data_path: str):
     dataset_kind = "CSV" if str(data_path).lower().endswith(".csv") else "SQLite"
     print(f"Loading {dataset_kind} dataset from: {data_path}")
 
-    # NOTE on downsample_to: the full spectrum is 1701 bands. A standard
-    # transformer's self-attention is O(L^2) in sequence length, so
-    # d_model=256 over 1701 positions is very slow on CPU. 170 keeps
-    # roughly the paper's ~10x compression ratio (they went 3x~1500 -> 160
-    # via autoencoder+PCA; here it's simple bin-averaging instead, which
-    # is a much cruder form of compression -- fine for an initial pass,
-    # worth replacing with something smarter once this end-to-end path works).
     X, Y, split, sample_ids = build_dataset(
         data_path, target_cols=task_names, downsample_to=170
     )
@@ -85,11 +89,6 @@ def main(data_path: str):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
-    # Model size: this is a real dataset (thousands of samples), so this
-    # is closer to the paper's own config than the small synthetic-data
-    # smoke test -- but still trimmed down a bit as a first pass on CPU.
-    # Scale d_model/dim_feedforward up once you've confirmed this runs
-    # and you're ready for a longer/GPU training run.
     model = FTIRNet(
         task_names,
         in_features=X_scaled.shape[1],
@@ -123,31 +122,48 @@ def main(data_path: str):
         if epoch % 10 == 0 or epoch == n_epochs - 1:
             print(
                 f"epoch {epoch:3d} | loss={epoch_loss / len(train_loader):.4f} "
-                f"mse={logs['mse']:.4f} kl={logs['kl']:.4f} ec={logs['ec']:.2f} "
+                f"nll={logs['nll']:.4f} kl={logs['kl']:.4f} ec={logs['ec']:.2f} "
                 f"alpha={logs['alpha']:.3f}"
             )
 
-    # ---- held-out evaluation on guo_subset's own 'test' split ----
+    calibration_factors = {}
     model.eval()
     with torch.no_grad():
         for t in task_names:
             preds_all, targets_all = [], []
+            sigma_all = []
             for x, y in test_loader:
                 x = x.to(device)
-                p = model(x)[t].cpu().numpy()
-                preds_all.append(p)
+                mean, log_var = model(x)[t]
+                preds_all.append(mean.cpu().numpy())
+                sigma_all.append(torch.exp(0.5 * log_var).cpu().numpy())
                 targets_all.append(y[t].numpy())
             preds_all = np.concatenate(preds_all)
+            sigma_all = np.concatenate(sigma_all)
             targets_all = np.concatenate(targets_all)
 
             preds_unscaled = y_scalers[t].inverse_transform(preds_all.reshape(-1, 1)).ravel()
             targets_unscaled = y_scalers[t].inverse_transform(targets_all.reshape(-1, 1)).ravel()
+            sigma_unscaled = sigma_all * y_scalers[t].scale_[0]
+            calibration_factors[t] = compute_calibration_factor(
+                preds_unscaled, sigma_unscaled, targets_unscaled
+            )
 
             ss_res = np.sum((targets_unscaled - preds_unscaled) ** 2)
             ss_tot = np.sum((targets_unscaled - targets_unscaled.mean()) ** 2)
             r2 = 1 - ss_res / ss_tot
             rmse = np.sqrt(ss_res / len(targets_unscaled))
-            print(f"{t}: R2={r2:.4f}  RMSE={rmse:.4f}")
+            avg_sigma = np.mean(sigma_unscaled * calibration_factors[t])
+            print(
+                f"{t}: R2={r2:.4f}  RMSE={rmse:.4f}  "
+                f"avg_sigma={avg_sigma:.4f}  calibration={calibration_factors[t]:.4f}"
+            )
+
+    return model, x_scaler, y_scalers, calibration_factors, task_names
+
+
+def main(data_path: str):
+    train_and_calibrate(data_path)
 
 
 if __name__ == "__main__":

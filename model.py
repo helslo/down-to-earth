@@ -167,8 +167,11 @@ class AttentionPool(nn.Module):
 
 
 class TaskHead(nn.Module):
-    """Task-specific transformer head: transformer layers -> attention
-    pooling -> linear projection to a scalar prediction."""
+    """Task-specific transformer head for heteroscedastic regression.
+
+    Each task predicts both a mean and a log-variance estimate, so the
+    model can report uncertainty alongside its regression value.
+    """
 
     def __init__(
         self,
@@ -189,12 +192,15 @@ class TaskHead(nn.Module):
         )
         self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
         self.pool = AttentionPool(d_model)
-        self.out = nn.Linear(d_model, 1)
+        self.mean_head = nn.Linear(d_model, 1)
+        self.logvar_head = nn.Linear(d_model, 1)
 
-    def forward(self, z: torch.Tensor) -> torch.Tensor:
+    def forward(self, z: torch.Tensor):
         z = self.encoder(z)
         pooled = self.pool(z)
-        return self.out(pooled).squeeze(-1)
+        mean = self.mean_head(pooled).squeeze(-1)
+        log_var = self.logvar_head(pooled).squeeze(-1)
+        return mean, log_var
 
 
 class FusionGate(nn.Module):
