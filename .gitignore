@@ -1,5 +1,6 @@
 # ignore data folder
 data/
 
-# ignore saved checkpoints
+# ignore saved checkpoints and csvs
 *.pt
+*.csv
