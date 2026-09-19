@@ -1,16 +1,21 @@
 """
 Train FTIRNet on real OSSL data, using the ready-made guo_subset
-benchmark targets and its predefined train/test split.
+benchmark targets and its predefined train/test split. A validation set
+is carved out of the 'train' rows for per-epoch monitoring and for
+uncertainty calibration; the 'test' rows are only used for final metrics.
 
 Usage:
     python train_model.py path/to/your_dataset.db
 """
 import argparse
+import csv
+import os
 import sys
 import numpy as np
 import torch
 from torch.utils.data import Dataset, DataLoader
 from sklearn.preprocessing import StandardScaler
+from tqdm import tqdm
 
 from model import FTIRNet
 from losses import total_loss
@@ -42,7 +47,59 @@ def compute_calibration_factor(predicted: np.ndarray, sigma: np.ndarray, target:
     return float(np.sqrt(np.mean(z ** 2)))
 
 
-def train_and_calibrate(data_path: str, epochs: int = 100, downsample_to: int = 170, max_samples: int = None):
+def carve_validation_split(split: np.ndarray, val_fraction: float, seed: int) -> np.ndarray:
+    """Relabel a random subset of 'train' rows as 'val'.
+
+    val_fraction is relative to the whole dataset, so with the predefined
+    ~80/20 train/test split, val_fraction=0.1 gives ~70/10/20
+    train/val/test. The 'test' rows are never touched, keeping results
+    comparable to the Guo et al. 2025 benchmark split.
+    """
+    split = split.astype(object)
+    train_idx = np.flatnonzero(split == "train")
+    n_val = int(round(val_fraction * len(split)))
+    if not 0 < n_val < len(train_idx):
+        raise ValueError(
+            f"val_fraction={val_fraction} asks for {n_val} validation rows, "
+            f"but only {len(train_idx)} train rows are available."
+        )
+    rng = np.random.default_rng(seed)
+    split[rng.choice(train_idx, size=n_val, replace=False)] = "val"
+    return split
+
+
+def evaluate_loss(model, loader, device, task_names, epoch, n_epochs, alpha_raw) -> dict:
+    """Batch-averaged loss and NLL on a held-out loader (no gradient updates)."""
+    model.eval()
+    sums = {"loss": 0.0, "nll": 0.0}
+    with torch.no_grad():
+        for x, y in loader:
+            x = x.to(device)
+            y = {t: y[t].to(device) for t in task_names}
+            loss, logs = total_loss(model(x), y, model, task_names, epoch, n_epochs, alpha_raw)
+            sums["loss"] += loss.item()
+            sums["nll"] += logs["nll"]
+    return {k: v / len(loader) for k, v in sums.items()}
+
+
+def predict_unscaled(model, loader, device, task, y_scaler):
+    """Return (mean, sigma, target) in original units for one task."""
+    model.eval()
+    preds_all, sigma_all, targets_all = [], [], []
+    with torch.no_grad():
+        for x, y in loader:
+            mean, log_var = model(x.to(device))[task]
+            preds_all.append(mean.cpu().numpy())
+            sigma_all.append(torch.exp(0.5 * log_var).cpu().numpy())
+            targets_all.append(y[task].numpy())
+    preds = y_scaler.inverse_transform(np.concatenate(preds_all).reshape(-1, 1)).ravel()
+    targets = y_scaler.inverse_transform(np.concatenate(targets_all).reshape(-1, 1)).ravel()
+    sigma = np.concatenate(sigma_all) * y_scaler.scale_[0]
+    return preds, sigma, targets
+
+
+def train_and_calibrate(data_path: str, epochs: int = 100, downsample_to: int = 170, max_samples: int = None,
+                        val_fraction: float = 0.1, split_seed: int = 42):
     # guo_subset's 5 properties that map onto the paper's target list.
     # Swap in 'CEC', 'Clay', 'P' here too/instead if that's more useful
     # for your farmer conversations -- they're in the same table.
@@ -61,38 +118,40 @@ def train_and_calibrate(data_path: str, epochs: int = 100, downsample_to: int = 
         for t in task_names:
             Y[t] = Y[t][:max_samples]
     print(f"Loaded {len(X)} samples with complete {task_names} targets.")
-    print(f"Split counts: {dict(zip(*np.unique(split, return_counts=True)))}")
+    split = carve_validation_split(split, val_fraction, split_seed)
+    counts = {s: int(np.sum(split == s)) for s in ("train", "val", "test")}
+    print("Split counts: " + ", ".join(
+        f"{s}={n} ({n / len(split):.0%})" for s, n in counts.items()
+    ))
 
-    train_mask = split == "train"
-    test_mask = split == "test"
+    masks = {s: split == s for s in ("train", "val", "test")}
 
-    x_scaler = StandardScaler().fit(X[train_mask])
+    # Scalers are fit on the training rows only, then applied everywhere.
+    x_scaler = StandardScaler().fit(X[masks["train"]])
     X_scaled = x_scaler.transform(X).astype(np.float32)
 
     y_scalers = {}
     Y_scaled = {}
     for t in task_names:
-        scaler = StandardScaler()
-        Y_scaled[t] = np.empty_like(Y[t])
-        Y_scaled[t][train_mask] = scaler.fit_transform(
-            Y[t][train_mask].reshape(-1, 1)
-        ).ravel()
-        Y_scaled[t][test_mask] = scaler.transform(
-            Y[t][test_mask].reshape(-1, 1)
-        ).ravel()
+        scaler = StandardScaler().fit(Y[t][masks["train"]].reshape(-1, 1))
+        Y_scaled[t] = scaler.transform(Y[t].reshape(-1, 1)).ravel().astype(np.float32)
         y_scalers[t] = scaler
 
-    train_ds = SoilDataset(
-        X_scaled[train_mask], {t: Y_scaled[t][train_mask] for t in task_names}, task_names
-    )
-    test_ds = SoilDataset(
-        X_scaled[test_mask], {t: Y_scaled[t][test_mask] for t in task_names}, task_names
-    )
+    datasets = {
+        s: SoilDataset(X_scaled[m], {t: Y_scaled[t][m] for t in task_names}, task_names)
+        for s, m in masks.items()
+    }
+    train_loader = DataLoader(datasets["train"], batch_size=64, shuffle=True)
+    val_loader = DataLoader(datasets["val"], batch_size=64)
+    test_loader = DataLoader(datasets["test"], batch_size=64)
 
-    train_loader = DataLoader(train_ds, batch_size=64, shuffle=True)
-    test_loader = DataLoader(test_ds, batch_size=64)
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # Prefer an NVIDIA GPU, then Apple Silicon's GPU (MPS), then CPU.
+    if torch.cuda.is_available():
+        device = torch.device("cuda")
+    elif torch.backends.mps.is_available():
+        device = torch.device("mps")
+    else:
+        device = torch.device("cpu")
     print(f"Using device: {device}")
 
     model = FTIRNet(
@@ -112,10 +171,12 @@ def train_and_calibrate(data_path: str, epochs: int = 100, downsample_to: int = 
     optimizer = torch.optim.Adam(list(model.parameters()) + [alpha_raw], lr=1e-3)
 
     n_epochs = epochs
+    history = []
     for epoch in range(n_epochs):
         model.train()
-        epoch_loss = 0.0
-        for x, y in train_loader:
+        sums = {"loss": 0.0, "nll": 0.0, "kl": 0.0, "alpha": 0.0}
+        progress = tqdm(train_loader, desc=f"epoch {epoch + 1}/{n_epochs}", leave=False)
+        for x, y in progress:
             x = x.to(device)
             y = {t: y[t].to(device) for t in task_names}
             preds = model(x)
@@ -124,48 +185,56 @@ def train_and_calibrate(data_path: str, epochs: int = 100, downsample_to: int = 
             loss.backward()
             torch.nn.utils.clip_grad_norm_(list(model.parameters()) + [alpha_raw], max_norm=1.0)
             optimizer.step()
-            epoch_loss += loss.item()
-        if epoch % max(1, n_epochs // 10) == 0 or epoch == n_epochs - 1:
-            print(
-                f"epoch {epoch:3d} | loss={epoch_loss / len(train_loader):.4f} "
-                f"nll={logs['nll']:.4f} kl={logs['kl']:.4f} ec={logs['ec']:.2f} "
-                f"alpha={logs['alpha']:.3f}"
-            )
+            sums["loss"] += loss.item()
+            for k in ("nll", "kl", "alpha"):
+                sums[k] += logs[k]
+            progress.set_postfix(loss=f"{loss.item():.4f}")
 
+        # Batch-averaged training statistics for this epoch, plus the same
+        # loss/NLL on the validation set for train-vs-val curves.
+        record = {"epoch": epoch, **{k: v / len(train_loader) for k, v in sums.items()},
+                  "ec": logs["ec"], "lambda_kl": logs["lambda_kl"]}
+        val_stats = evaluate_loss(model, val_loader, device, task_names, epoch, n_epochs, alpha_raw)
+        record.update({f"val_{k}": v for k, v in val_stats.items()})
+        history.append(record)
+        tqdm.write(
+            f"epoch {epoch:3d} | loss={record['loss']:.4f} "
+            f"nll={record['nll']:.4f} kl={record['kl']:.4f} ec={record['ec']:.2f} "
+            f"alpha={record['alpha']:.3f} | val_loss={record['val_loss']:.4f} "
+            f"val_nll={record['val_nll']:.4f}"
+        )
+
+    # Calibrate uncertainty on the validation set, then report on the
+    # untouched test set so the reported numbers are not tuned on it.
     calibration_factors = {}
-    model.eval()
-    with torch.no_grad():
-        for t in task_names:
-            preds_all, targets_all = [], []
-            sigma_all = []
-            for x, y in test_loader:
-                x = x.to(device)
-                mean, log_var = model(x)[t]
-                preds_all.append(mean.cpu().numpy())
-                sigma_all.append(torch.exp(0.5 * log_var).cpu().numpy())
-                targets_all.append(y[t].numpy())
-            preds_all = np.concatenate(preds_all)
-            sigma_all = np.concatenate(sigma_all)
-            targets_all = np.concatenate(targets_all)
+    print("Test-set results (calibration fitted on validation set):")
+    for t in task_names:
+        val_pred, val_sigma, val_target = predict_unscaled(model, val_loader, device, t, y_scalers[t])
+        calibration_factors[t] = compute_calibration_factor(val_pred, val_sigma, val_target)
 
-            preds_unscaled = y_scalers[t].inverse_transform(preds_all.reshape(-1, 1)).ravel()
-            targets_unscaled = y_scalers[t].inverse_transform(targets_all.reshape(-1, 1)).ravel()
-            sigma_unscaled = sigma_all * y_scalers[t].scale_[0]
-            calibration_factors[t] = compute_calibration_factor(
-                preds_unscaled, sigma_unscaled, targets_unscaled
-            )
+        preds, sigma, targets = predict_unscaled(model, test_loader, device, t, y_scalers[t])
+        sigma_cal = sigma * calibration_factors[t]
+        ss_res = np.sum((targets - preds) ** 2)
+        ss_tot = np.sum((targets - targets.mean()) ** 2)
+        r2 = 1 - ss_res / ss_tot
+        rmse = np.sqrt(ss_res / len(targets))
+        # ~1.0 means the calibrated sigmas match the test-set errors.
+        z_rms = compute_calibration_factor(preds, sigma_cal, targets)
+        print(
+            f"{t}: R2={r2:.4f}  RMSE={rmse:.4f}  "
+            f"avg_sigma={np.mean(sigma_cal):.4f}  calibration={calibration_factors[t]:.4f}  "
+            f"test_z_rms={z_rms:.4f}"
+        )
 
-            ss_res = np.sum((targets_unscaled - preds_unscaled) ** 2)
-            ss_tot = np.sum((targets_unscaled - targets_unscaled.mean()) ** 2)
-            r2 = 1 - ss_res / ss_tot
-            rmse = np.sqrt(ss_res / len(targets_unscaled))
-            avg_sigma = np.mean(sigma_unscaled * calibration_factors[t])
-            print(
-                f"{t}: R2={r2:.4f}  RMSE={rmse:.4f}  "
-                f"avg_sigma={avg_sigma:.4f}  calibration={calibration_factors[t]:.4f}"
-            )
+    return model, x_scaler, y_scalers, calibration_factors, task_names, history
 
-    return model, x_scaler, y_scalers, calibration_factors, task_names
+
+def save_history(history: list, path: str):
+    """Write per-epoch training statistics to a CSV for later plotting."""
+    with open(path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=list(history[0].keys()))
+        writer.writeheader()
+        writer.writerows(history)
 
 
 def save_checkpoint(model, x_scaler, y_scalers, calibration_factors, task_names, downsample_to: int, path: str = "model_state.pt"):
@@ -185,15 +254,23 @@ def save_checkpoint(model, x_scaler, y_scalers, calibration_factors, task_names,
     )
 
 
-def main(data_path: str, epochs: int = 100, downsample_to: int = 170, max_samples: int = None, save_path: str = "model_state.pt"):
-    model, x_scaler, y_scalers, calibration_factors, task_names = train_and_calibrate(
+def main(data_path: str, epochs: int = 100, downsample_to: int = 170, max_samples: int = None,
+         save_path: str = "model_state.pt", history_path: str = None,
+         val_fraction: float = 0.1, split_seed: int = 42):
+    model, x_scaler, y_scalers, calibration_factors, task_names, history = train_and_calibrate(
         data_path,
         epochs=epochs,
         downsample_to=downsample_to,
         max_samples=max_samples,
+        val_fraction=val_fraction,
+        split_seed=split_seed,
     )
     save_checkpoint(model, x_scaler, y_scalers, calibration_factors, task_names, downsample_to, path=save_path)
     print(f"Saved checkpoint to {save_path}")
+    if history_path is None:
+        history_path = os.path.splitext(save_path)[0] + "_history.csv"
+    save_history(history, history_path)
+    print(f"Saved training history to {history_path}")
 
 
 if __name__ == "__main__":
@@ -203,6 +280,12 @@ if __name__ == "__main__":
     parser.add_argument("--downsample-to", type=int, default=170, help="Spectral downsampling target")
     parser.add_argument("--max-samples", type=int, default=None, help="Limit rows for a quick smoke test")
     parser.add_argument("--save-path", default="model_state.pt", help="Location for the saved checkpoint")
+    parser.add_argument("--history-path", default=None,
+                        help="CSV for per-epoch training stats (default: <save-path stem>_history.csv)")
+    parser.add_argument("--val-fraction", type=float, default=0.1,
+                        help="Fraction of all samples moved from 'train' to a validation set")
+    parser.add_argument("--split-seed", type=int, default=42,
+                        help="Random seed for choosing the validation rows")
     args = parser.parse_args()
 
     main(
@@ -211,4 +294,7 @@ if __name__ == "__main__":
         downsample_to=args.downsample_to,
         max_samples=args.max_samples,
         save_path=args.save_path,
+        history_path=args.history_path,
+        val_fraction=args.val_fraction,
+        split_seed=args.split_seed,
     )
