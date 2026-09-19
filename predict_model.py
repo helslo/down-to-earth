@@ -34,18 +34,20 @@ def load_model_checkpoint(checkpoint_path: str):
     task_names = state["task_names"]
     fusion_edges = state["fusion_edges"]
 
-    model = FTIRNet(
-        task_names,
-        in_features=state["x_scaler_mean"].shape[0],
-        d_model=128,
-        nhead=8,
-        shared_layers=2,
-        task_layers=2,
-        dim_feedforward=512,
-        dropout=0.1,
-        fusion_edges=fusion_edges,
-        fixed_gamma=None,
-    )
+    model_config = state.get("model_config")
+    if model_config is None:
+        # Checkpoints saved before model_config was stored used these settings.
+        model_config = {
+            "in_features": state["x_scaler_mean"].shape[0],
+            "d_model": 128,
+            "nhead": 8,
+            "shared_layers": 2,
+            "task_layers": 2,
+            "dim_feedforward": 512,
+            "dropout": 0.1,
+            "fixed_gamma": None,
+        }
+    model = FTIRNet(task_names, fusion_edges=fusion_edges, **model_config)
     model.load_state_dict(state["model_state"])
     model.eval()
 
