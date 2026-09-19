@@ -8,13 +8,15 @@ This repository trains a multitask soil-property model based on FTIR spectra. Th
 ## Recommended workflow
 
 1. Prepare your dataset as either a SQLite database or a CSV file.
-2. Train the model and save a checkpoint:
+2. Train the model. Each run gets its own folder, models/<YYYY-MM-DD_HHMMSS>[_<run-name>]/,
+   containing model.pt, history.csv (per-epoch train/val stats), test_metrics.csv and
+   config.json (settings, git commit, device, split counts):
 
-   .venv/bin/python train_model.py data/features_samples.csv
+   .venv/bin/python train_model.py data/features_samples.csv --run-name baseline
 
-3. Use the saved checkpoint for inference only:
+3. Use a saved checkpoint for inference only:
 
-   .venv/bin/python predict_model.py model_state.pt data/features_samples.csv
+   .venv/bin/python predict_model.py models/<run-folder>/model.pt data/features_samples.csv
 
 4. Adjust the task names, fusion edges, and model settings in train_model.py for your target properties.
 

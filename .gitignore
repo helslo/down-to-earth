@@ -1,6 +1,8 @@
-# ignore data folder
+# ignore folders
 data/
+models/
 
-# ignore saved checkpoints and csvs
+
+# ignore file types
 *.pt
 *.csv

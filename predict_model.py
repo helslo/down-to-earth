@@ -4,7 +4,7 @@ This script does not train. It expects a saved model checkpoint created by
 train_model.py and then predicts on new rows from CSV or SQLite sources.
 
 Usage:
-    python predict_model.py model_state.pt data/features_samples.csv --output predictions.csv
+    python predict_model.py models/<run-folder>/model.pt data/features_samples.csv --output predictions.csv
 """
 import csv
 import sys
@@ -135,7 +135,7 @@ def main(checkpoint_path: str, data_path: str, downsample_to: int = None, output
 
 if __name__ == "__main__":
     if len(sys.argv) not in (3, 5, 7):
-        print("Usage: python predict_model.py path/to/model_state.pt path/to/your_dataset.db OR path/to/your_dataset.csv [--downsample-to N] [--output path.csv]")
+        print("Usage: python predict_model.py models/<run-folder>/model.pt path/to/your_dataset.db OR path/to/your_dataset.csv [--downsample-to N] [--output path.csv]")
         sys.exit(1)
 
     if len(sys.argv) == 5 and sys.argv[3] == "--downsample-to":

@@ -4,13 +4,20 @@ benchmark targets and its predefined train/test split. A validation set
 is carved out of the 'train' rows for per-epoch monitoring and for
 uncertainty calibration; the 'test' rows are only used for final metrics.
 
+Each run writes into its own folder, models/<timestamp>[_<run-name>]/,
+containing model.pt, history.csv, test_metrics.csv and config.json.
+
 Usage:
-    python train_model.py path/to/your_dataset.db
+    python train_model.py path/to/your_dataset.db [--run-name no-fusion]
 """
 import argparse
 import csv
+import json
 import os
+import re
+import subprocess
 import sys
+from datetime import datetime
 import numpy as np
 import torch
 from torch.utils.data import Dataset, DataLoader
@@ -141,9 +148,11 @@ def train_and_calibrate(data_path: str, epochs: int = 100, downsample_to: int = 
         s: SoilDataset(X_scaled[m], {t: Y_scaled[t][m] for t in task_names}, task_names)
         for s, m in masks.items()
     }
-    train_loader = DataLoader(datasets["train"], batch_size=64, shuffle=True)
-    val_loader = DataLoader(datasets["val"], batch_size=64)
-    test_loader = DataLoader(datasets["test"], batch_size=64)
+    batch_size = 64
+    lr = 1e-3
+    train_loader = DataLoader(datasets["train"], batch_size=batch_size, shuffle=True)
+    val_loader = DataLoader(datasets["val"], batch_size=batch_size)
+    test_loader = DataLoader(datasets["test"], batch_size=batch_size)
 
     # Prefer an NVIDIA GPU, then Apple Silicon's GPU (MPS), then CPU.
     if torch.cuda.is_available():
@@ -154,21 +163,20 @@ def train_and_calibrate(data_path: str, epochs: int = 100, downsample_to: int = 
         device = torch.device("cpu")
     print(f"Using device: {device}")
 
-    model = FTIRNet(
-        task_names,
-        in_features=X_scaled.shape[1],
-        d_model=128,
-        nhead=8,
-        shared_layers=2,
-        task_layers=2,
-        dim_feedforward=512,
-        dropout=0.1,
-        fusion_edges=fusion_edges,
-        fixed_gamma=None,
-    ).to(device)
+    model_config = {
+        "in_features": int(X_scaled.shape[1]),
+        "d_model": 128,
+        "nhead": 8,
+        "shared_layers": 2,
+        "task_layers": 2,
+        "dim_feedforward": 512,
+        "dropout": 0.1,
+        "fixed_gamma": None,
+    }
+    model = FTIRNet(task_names, fusion_edges=fusion_edges, **model_config).to(device)
 
     alpha_raw = torch.nn.Parameter(torch.tensor(0.5413, device=device))
-    optimizer = torch.optim.Adam(list(model.parameters()) + [alpha_raw], lr=1e-3)
+    optimizer = torch.optim.Adam(list(model.parameters()) + [alpha_raw], lr=lr)
 
     n_epochs = epochs
     history = []
@@ -207,6 +215,7 @@ def train_and_calibrate(data_path: str, epochs: int = 100, downsample_to: int = 
     # Calibrate uncertainty on the validation set, then report on the
     # untouched test set so the reported numbers are not tuned on it.
     calibration_factors = {}
+    test_metrics = []
     print("Test-set results (calibration fitted on validation set):")
     for t in task_names:
         val_pred, val_sigma, val_target = predict_unscaled(model, val_loader, device, t, y_scalers[t])
@@ -220,30 +229,80 @@ def train_and_calibrate(data_path: str, epochs: int = 100, downsample_to: int = 
         rmse = np.sqrt(ss_res / len(targets))
         # ~1.0 means the calibrated sigmas match the test-set errors.
         z_rms = compute_calibration_factor(preds, sigma_cal, targets)
+        test_metrics.append({
+            "task": t,
+            "n_test": len(targets),
+            "r2": float(r2),
+            "rmse": float(rmse),
+            "avg_sigma": float(np.mean(sigma_cal)),
+            "calibration": calibration_factors[t],
+            "test_z_rms": z_rms,
+        })
         print(
             f"{t}: R2={r2:.4f}  RMSE={rmse:.4f}  "
             f"avg_sigma={np.mean(sigma_cal):.4f}  calibration={calibration_factors[t]:.4f}  "
             f"test_z_rms={z_rms:.4f}"
         )
 
-    return model, x_scaler, y_scalers, calibration_factors, task_names, history
+    # Settings decided inside training, recorded in the run's config.json.
+    run_info = {
+        "device": str(device),
+        "split_counts": counts,
+        "task_names": task_names,
+        "fusion_edges": fusion_edges,
+        "model_config": model_config,
+        "batch_size": batch_size,
+        "lr": lr,
+    }
+    return model, x_scaler, y_scalers, calibration_factors, task_names, history, test_metrics, run_info
 
 
-def save_history(history: list, path: str):
-    """Write per-epoch training statistics to a CSV for later plotting."""
+def save_csv(rows: list, path: str):
+    """Write a list of same-keyed dicts (e.g. per-epoch stats) to a CSV."""
     with open(path, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=list(history[0].keys()))
+        writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
         writer.writeheader()
-        writer.writerows(history)
+        writer.writerows(rows)
 
 
-def save_checkpoint(model, x_scaler, y_scalers, calibration_factors, task_names, downsample_to: int, path: str = "model_state.pt"):
+def make_run_dir(output_dir: str, run_name: str, started: datetime) -> str:
+    """Create models/<YYYY-MM-DD_HHMMSS>[_<run_name>]/, refusing to reuse one."""
+    name = started.strftime("%Y-%m-%d_%H%M%S")
+    if run_name:
+        # Keep folder names shell- and filesystem-friendly.
+        name += "_" + re.sub(r"[^A-Za-z0-9._-]+", "-", run_name).strip("-")
+    path = os.path.join(output_dir, name)
+    os.makedirs(path)  # raises FileExistsError instead of overwriting a run
+    return path
+
+
+def git_state() -> dict:
+    """Commit hash and whether there were uncommitted changes, if available."""
+    repo = os.path.dirname(os.path.abspath(__file__))
+    try:
+        commit = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True,
+                                text=True, check=True).stdout.strip()
+        status = subprocess.run(["git", "status", "--porcelain"], cwd=repo, capture_output=True,
+                                text=True, check=True).stdout
+    except (OSError, subprocess.CalledProcessError):
+        return {"git_commit": None, "git_dirty": None}
+    return {"git_commit": commit, "git_dirty": bool(status.strip())}
+
+
+def save_json(data: dict, path: str):
+    with open(path, "w") as f:
+        json.dump(data, f, indent=2)
+
+
+def save_checkpoint(model, x_scaler, y_scalers, calibration_factors, task_names, downsample_to: int,
+                    path: str, model_config: dict = None):
     """Save the fitted model + preprocessing state for later pure prediction."""
     torch.save(
         {
             "model_state": model.state_dict(),
             "task_names": task_names,
             "fusion_edges": model.fusion_edges,
+            "model_config": model_config,
             "downsample_to": int(downsample_to),
             "x_scaler_mean": x_scaler.mean_.copy(),
             "x_scaler_scale": x_scaler.scale_.copy(),
@@ -255,22 +314,57 @@ def save_checkpoint(model, x_scaler, y_scalers, calibration_factors, task_names,
 
 
 def main(data_path: str, epochs: int = 100, downsample_to: int = 170, max_samples: int = None,
-         save_path: str = "model_state.pt", history_path: str = None,
+         output_dir: str = "models", run_name: str = None,
          val_fraction: float = 0.1, split_seed: int = 42):
-    model, x_scaler, y_scalers, calibration_factors, task_names, history = train_and_calibrate(
-        data_path,
-        epochs=epochs,
-        downsample_to=downsample_to,
-        max_samples=max_samples,
-        val_fraction=val_fraction,
-        split_seed=split_seed,
-    )
-    save_checkpoint(model, x_scaler, y_scalers, calibration_factors, task_names, downsample_to, path=save_path)
-    print(f"Saved checkpoint to {save_path}")
-    if history_path is None:
-        history_path = os.path.splitext(save_path)[0] + "_history.csv"
-    save_history(history, history_path)
-    print(f"Saved training history to {history_path}")
+    started = datetime.now()
+    run_dir = make_run_dir(output_dir, run_name, started)
+    print(f"Run folder: {run_dir}")
+
+    # Written before training starts so even a crashed run records its settings;
+    # "status" tells finished runs apart from failed or interrupted ones.
+    config = {
+        "status": "running",
+        "started_at": started.isoformat(timespec="seconds"),
+        "finished_at": None,
+        "args": {
+            "data_path": data_path,
+            "epochs": epochs,
+            "downsample_to": downsample_to,
+            "max_samples": max_samples,
+            "val_fraction": val_fraction,
+            "split_seed": split_seed,
+            "run_name": run_name,
+        },
+        **git_state(),
+        "torch_version": torch.__version__,
+    }
+    config_path = os.path.join(run_dir, "config.json")
+    save_json(config, config_path)
+
+    try:
+        (model, x_scaler, y_scalers, calibration_factors, task_names,
+         history, test_metrics, run_info) = train_and_calibrate(
+            data_path,
+            epochs=epochs,
+            downsample_to=downsample_to,
+            max_samples=max_samples,
+            val_fraction=val_fraction,
+            split_seed=split_seed,
+        )
+    except BaseException as e:
+        config["status"] = "interrupted" if isinstance(e, KeyboardInterrupt) else "failed"
+        save_json(config, config_path)
+        raise
+
+    save_checkpoint(model, x_scaler, y_scalers, calibration_factors, task_names, downsample_to,
+                    path=os.path.join(run_dir, "model.pt"), model_config=run_info["model_config"])
+    save_csv(history, os.path.join(run_dir, "history.csv"))
+    save_csv(test_metrics, os.path.join(run_dir, "test_metrics.csv"))
+    config.update(run_info)
+    config["status"] = "finished"
+    config["finished_at"] = datetime.now().isoformat(timespec="seconds")
+    save_json(config, config_path)
+    print(f"Saved model.pt, history.csv, test_metrics.csv and config.json to {run_dir}")
 
 
 if __name__ == "__main__":
@@ -279,9 +373,10 @@ if __name__ == "__main__":
     parser.add_argument("--epochs", type=int, default=100, help="Number of training epochs")
     parser.add_argument("--downsample-to", type=int, default=170, help="Spectral downsampling target")
     parser.add_argument("--max-samples", type=int, default=None, help="Limit rows for a quick smoke test")
-    parser.add_argument("--save-path", default="model_state.pt", help="Location for the saved checkpoint")
-    parser.add_argument("--history-path", default=None,
-                        help="CSV for per-epoch training stats (default: <save-path stem>_history.csv)")
+    parser.add_argument("--output-dir", default="models",
+                        help="Parent folder for run folders (default: models)")
+    parser.add_argument("--run-name", default=None,
+                        help="Optional label appended to the timestamped run folder, e.g. no-fusion")
     parser.add_argument("--val-fraction", type=float, default=0.1,
                         help="Fraction of all samples moved from 'train' to a validation set")
     parser.add_argument("--split-seed", type=int, default=42,
@@ -293,8 +388,8 @@ if __name__ == "__main__":
         epochs=args.epochs,
         downsample_to=args.downsample_to,
         max_samples=args.max_samples,
-        save_path=args.save_path,
-        history_path=args.history_path,
+        output_dir=args.output_dir,
+        run_name=args.run_name,
         val_fraction=args.val_fraction,
         split_seed=args.split_seed,
     )
