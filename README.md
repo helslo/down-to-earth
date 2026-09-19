@@ -10,7 +10,8 @@ This repository trains a multitask soil-property model based on FTIR spectra. Th
 1. Prepare your dataset as either a SQLite database or a CSV file.
 2. Train the model. Each run gets its own folder, models/<YYYY-MM-DD_HHMMSS>[_<run-name>]/,
    containing model.pt, history.csv (per-epoch train/val stats), test_metrics.csv and
-   config.json (settings, git commit, device, split counts):
+   metadata.json (command, settings, data file + SHA-256, sample/split counts, model
+   config, timing, results summary, environment and git commit):
 
    .venv/bin/python train_model.py data/features_samples.csv --run-name baseline
 

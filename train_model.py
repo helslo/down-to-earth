@@ -5,20 +5,23 @@ is carved out of the 'train' rows for per-epoch monitoring and for
 uncertainty calibration; the 'test' rows are only used for final metrics.
 
 Each run writes into its own folder, models/<timestamp>[_<run-name>]/,
-containing model.pt, history.csv, test_metrics.csv and config.json.
+containing model.pt, history.csv, test_metrics.csv and metadata.json.
 
 Usage:
     python train_model.py path/to/your_dataset.db [--run-name no-fusion]
 """
 import argparse
 import csv
+import hashlib
 import json
 import os
+import platform
 import re
 import subprocess
 import sys
 from datetime import datetime
 import numpy as np
+import sklearn
 import torch
 from torch.utils.data import Dataset, DataLoader
 from sklearn.preprocessing import StandardScaler
@@ -26,7 +29,7 @@ from tqdm import tqdm
 
 from model import FTIRNet
 from losses import total_loss
-from load_data import build_dataset
+from load_data import build_dataset, CSV_TARGET_ALIASES
 
 
 class SoilDataset(Dataset):
@@ -119,6 +122,7 @@ def train_and_calibrate(data_path: str, epochs: int = 100, downsample_to: int = 
     X, Y, split, sample_ids = build_dataset(
         data_path, target_cols=task_names, downsample_to=downsample_to
     )
+    n_usable = len(X)
     if max_samples is not None and max_samples < len(X):
         X = X[:max_samples]
         split = split[:max_samples]
@@ -175,7 +179,9 @@ def train_and_calibrate(data_path: str, epochs: int = 100, downsample_to: int = 
     }
     model = FTIRNet(task_names, fusion_edges=fusion_edges, **model_config).to(device)
 
-    alpha_raw = torch.nn.Parameter(torch.tensor(0.5413, device=device))
+    alpha_init_raw = 0.5413
+    grad_clip = 1.0
+    alpha_raw = torch.nn.Parameter(torch.tensor(alpha_init_raw, device=device))
     optimizer = torch.optim.Adam(list(model.parameters()) + [alpha_raw], lr=lr)
 
     n_epochs = epochs
@@ -191,7 +197,7 @@ def train_and_calibrate(data_path: str, epochs: int = 100, downsample_to: int = 
             loss, logs = total_loss(preds, y, model, task_names, epoch, n_epochs, alpha_raw)
             optimizer.zero_grad()
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(list(model.parameters()) + [alpha_raw], max_norm=1.0)
+            torch.nn.utils.clip_grad_norm_(list(model.parameters()) + [alpha_raw], max_norm=grad_clip)
             optimizer.step()
             sums["loss"] += loss.item()
             for k in ("nll", "kl", "alpha"):
@@ -244,15 +250,44 @@ def train_and_calibrate(data_path: str, epochs: int = 100, downsample_to: int = 
             f"test_z_rms={z_rms:.4f}"
         )
 
-    # Settings decided inside training, recorded in the run's config.json.
+    # Details only known inside training, merged into the run's metadata.json.
+    is_csv = str(data_path).lower().endswith(".csv")
+    best = min(history, key=lambda r: r["val_nll"])
     run_info = {
-        "device": str(device),
-        "split_counts": counts,
-        "task_names": task_names,
-        "fusion_edges": fusion_edges,
-        "model_config": model_config,
-        "batch_size": batch_size,
-        "lr": lr,
+        "data": {
+            "n_samples_usable": n_usable,  # rows with complete features + targets
+            "n_samples_used": len(X),      # after --max-samples
+            "n_features": int(X.shape[1]),
+            "split_counts": counts,
+            "split_source": "predefined train/test; val carved from train",
+            # task name -> column it was read from in the dataset
+            "target_columns": {t: CSV_TARGET_ALIASES.get(t, t) if is_csv else t for t in task_names},
+            "target_stats_train": {
+                t: {"mean": float(y_scalers[t].mean_[0]), "std": float(y_scalers[t].scale_[0])}
+                for t in task_names
+            },
+        },
+        "model": {
+            "task_names": task_names,
+            "fusion_edges": fusion_edges,
+            "model_config": model_config,
+            "n_parameters": sum(p.numel() for p in model.parameters()),
+        },
+        "training": {
+            "device": str(device),
+            "epochs_completed": len(history),
+            "batch_size": batch_size,
+            "optimizer": "Adam",
+            "lr": lr,
+            "grad_clip_max_norm": grad_clip,
+            "alpha_init_raw": alpha_init_raw,
+        },
+        "results": {
+            "final_epoch": {k: history[-1][k] for k in ("epoch", "nll", "val_nll")},
+            "best_val_epoch": {k: best[k] for k in ("epoch", "nll", "val_nll")},
+            "calibration_factors": calibration_factors,
+            "test_metrics": {m["task"]: {k: v for k, v in m.items() if k != "task"} for m in test_metrics},
+        },
     }
     return model, x_scaler, y_scalers, calibration_factors, task_names, history, test_metrics, run_info
 
@@ -289,6 +324,33 @@ def git_state() -> dict:
     return {"git_commit": commit, "git_dirty": bool(status.strip())}
 
 
+def data_file_info(path: str) -> dict:
+    """Identify the exact dataset file used: location, size, mtime and SHA-256."""
+    sha = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            sha.update(chunk)
+    stat = os.stat(path)
+    return {
+        "path": path,
+        "abs_path": os.path.abspath(path),
+        "size_bytes": stat.st_size,
+        "modified_at": datetime.fromtimestamp(stat.st_mtime).isoformat(timespec="seconds"),
+        "sha256": sha.hexdigest(),
+    }
+
+
+def environment_info() -> dict:
+    return {
+        "python": platform.python_version(),
+        "platform": platform.platform(),
+        "torch": torch.__version__,
+        "numpy": np.__version__,
+        "scikit_learn": sklearn.__version__,
+        **git_state(),
+    }
+
+
 def save_json(data: dict, path: str):
     with open(path, "w") as f:
         json.dump(data, f, indent=2)
@@ -317,15 +379,21 @@ def main(data_path: str, epochs: int = 100, downsample_to: int = 170, max_sample
          output_dir: str = "models", run_name: str = None,
          val_fraction: float = 0.1, split_seed: int = 42):
     started = datetime.now()
+    data_file = data_file_info(data_path)  # fails early on a bad path, before any folder exists
     run_dir = make_run_dir(output_dir, run_name, started)
     print(f"Run folder: {run_dir}")
 
     # Written before training starts so even a crashed run records its settings;
     # "status" tells finished runs apart from failed or interrupted ones.
-    config = {
+    metadata = {
+        "run_name": run_name,
         "status": "running",
-        "started_at": started.isoformat(timespec="seconds"),
-        "finished_at": None,
+        "command": " ".join(sys.argv),
+        "timing": {
+            "started_at": started.isoformat(timespec="seconds"),
+            "finished_at": None,
+            "duration_seconds": None,
+        },
         "args": {
             "data_path": data_path,
             "epochs": epochs,
@@ -333,13 +401,19 @@ def main(data_path: str, epochs: int = 100, downsample_to: int = 170, max_sample
             "max_samples": max_samples,
             "val_fraction": val_fraction,
             "split_seed": split_seed,
-            "run_name": run_name,
         },
-        **git_state(),
-        "torch_version": torch.__version__,
+        "data": {"file": data_file},
+        "environment": environment_info(),
     }
-    config_path = os.path.join(run_dir, "config.json")
-    save_json(config, config_path)
+    metadata_path = os.path.join(run_dir, "metadata.json")
+    save_json(metadata, metadata_path)
+
+    def finish(status: str):
+        finished = datetime.now()
+        metadata["status"] = status
+        metadata["timing"]["finished_at"] = finished.isoformat(timespec="seconds")
+        metadata["timing"]["duration_seconds"] = round((finished - started).total_seconds(), 1)
+        save_json(metadata, metadata_path)
 
     try:
         (model, x_scaler, y_scalers, calibration_factors, task_names,
@@ -352,19 +426,18 @@ def main(data_path: str, epochs: int = 100, downsample_to: int = 170, max_sample
             split_seed=split_seed,
         )
     except BaseException as e:
-        config["status"] = "interrupted" if isinstance(e, KeyboardInterrupt) else "failed"
-        save_json(config, config_path)
+        finish("interrupted" if isinstance(e, KeyboardInterrupt) else "failed")
         raise
 
     save_checkpoint(model, x_scaler, y_scalers, calibration_factors, task_names, downsample_to,
-                    path=os.path.join(run_dir, "model.pt"), model_config=run_info["model_config"])
+                    path=os.path.join(run_dir, "model.pt"), model_config=run_info["model"]["model_config"])
     save_csv(history, os.path.join(run_dir, "history.csv"))
     save_csv(test_metrics, os.path.join(run_dir, "test_metrics.csv"))
-    config.update(run_info)
-    config["status"] = "finished"
-    config["finished_at"] = datetime.now().isoformat(timespec="seconds")
-    save_json(config, config_path)
-    print(f"Saved model.pt, history.csv, test_metrics.csv and config.json to {run_dir}")
+    metadata["data"].update(run_info["data"])
+    for section in ("model", "training", "results"):
+        metadata[section] = run_info[section]
+    finish("finished")
+    print(f"Saved model.pt, history.csv, test_metrics.csv and metadata.json to {run_dir}")
 
 
 if __name__ == "__main__":
